@@ -1,0 +1,95 @@
+#include "cache.h"
+
+uint32_t visit_freq[LLC_SET][LLC_WAY];
+
+// initialize replacement state
+void CACHE::llc_initialize_replacement()
+{
+    cout << "Initialize LFU state" << endl;
+    for (int i = 0; i < LLC_SET; i++) {
+        for (int j = 0; j < LLC_WAY; j++) {
+            visit_freq[i][j] = 0;
+        }
+    }
+}
+
+// find replacement victim
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    uint32_t way = 0;
+
+    // fill invalid line first
+    for (way=0; way<NUM_WAY; way++) {
+        if (block[set][way].valid == false) {
+
+            DP ( if (warmup_complete[cpu]) {
+            cout << "[" << NAME << "] " << __func__ << " instr_id: " << instr_id << " invalid set: " << set << " way: " << way;
+            cout << hex << " address: " << (full_addr>>LOG2_BLOCK_SIZE) << " victim address: " << block[set][way].address << " data: " << block[set][way].data;
+            cout << dec << " lru: " << block[set][way].lru << endl; });
+
+            break;
+        }
+    }
+
+    // LFU victim
+    uint32_t min_freq = visit_freq[set][0];
+    if (way == NUM_WAY) {
+    	way = 0;
+        for (uint32_t i=1; i<NUM_WAY; i++) {
+            if (visit_freq[set][i] < min_freq) {
+                min_freq = visit_freq[set][i];
+                way = i;
+            }
+        }
+    }
+
+    if (way == NUM_WAY) {
+        cerr << "[" << NAME << "] " << __func__ << " no victim! set: " << set << endl;
+        assert(0);
+    }
+
+    return way;
+}
+
+// called on every cache hit and cache fill
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    string TYPE_NAME;
+    if (type == LOAD)
+        TYPE_NAME = "LOAD";
+    else if (type == RFO)
+        TYPE_NAME = "RFO";
+    else if (type == PREFETCH)
+        TYPE_NAME = "PF";
+    else if (type == WRITEBACK)
+        TYPE_NAME = "WB";
+    else
+        assert(0);
+
+    if (hit)
+        TYPE_NAME += "_HIT";
+    else
+        TYPE_NAME += "_MISS";
+
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+    
+    // cout << "CPU: " << cpu << "  LLC " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
+    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
+
+    if(hit){
+        visit_freq[set][way]++;
+        if(type != WRITEBACK){
+            block[set][way].lru++;
+        }
+    }
+    else{
+        visit_freq[set][way] = 1;
+        block[set][way].lru++;
+    }
+}
+
+// use this function to print out your own stats at the end of simulation
+void CACHE::llc_replacement_final_stats()
+{
+}

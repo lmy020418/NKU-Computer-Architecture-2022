@@ -1,0 +1,97 @@
+#include "cache.h"
+#include <vector>
+
+#define IT_SIZE 256
+#define GHB_SIZE 256
+#define LAST_ADDRESS_LEN 3
+
+# define pref_lookahead 1
+# define pref_degree 9
+
+struct IT_Entry {
+    uint64_t ip;
+    uint64_t ghb_ptr;
+};
+struct GHB_Entry {
+    uint64_t cl_addr;
+    uint64_t prev_ptr;
+};
+
+static IT_Entry IT[IT_SIZE];
+static GHB_Entry GHB[GHB_SIZE];
+static uint64_t curr_ptr = 0; 
+
+void operate_ghb(uint64_t addr, uint64_t ip) {
+    IT_Entry &curr_it = IT[ip % IT_SIZE];
+    GHB_Entry &curr_ghb = GHB[curr_ptr % GHB_SIZE];
+
+    if(curr_it.ip == ip){
+        curr_ghb.prev_ptr = curr_it.ghb_ptr;
+        curr_it.ghb_ptr = curr_ptr;
+    }
+    else{
+        curr_ghb.prev_ptr = -1;
+        curr_it.ip = ip;
+        curr_it.ghb_ptr = curr_ptr;
+    }
+
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    curr_ghb.cl_addr = cl_addr;
+}
+
+void CACHE::l2c_prefetcher_initialize()
+{
+    cout << "CPU " << cpu << " L2C GHB prefetcher" << endl;
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+    std::vector<uint64_t> cl_addr_list;
+    uint64_t pref_cl_addr = 0;
+    bool ghb_ctrl = 1;
+    uint64_t stride = 0;
+    operate_ghb(addr, ip);
+
+    uint64_t curr_index = curr_ptr;
+    while ((curr_index != uint64_t(-1)) && (curr_ptr - curr_index < GHB_SIZE)) {
+        GHB_Entry &curr_ghb = GHB[curr_index % GHB_SIZE];
+        cl_addr_list.push_back(curr_ghb.cl_addr);
+        curr_index = curr_ghb.prev_ptr;
+    }
+
+    if (cl_addr_list.size() < LAST_ADDRESS_LEN) {
+        ghb_ctrl = 0;
+    }
+    if (cl_addr_list[0] - cl_addr_list[1] == 0) {
+        ghb_ctrl = 0;
+    }
+    else{
+        for (int i = 1; i < LAST_ADDRESS_LEN - 1; i++) {
+            stride = cl_addr_list[i] - cl_addr_list[i + 1];
+            if (stride != cl_addr_list[0] - cl_addr_list[1]) {
+                ghb_ctrl = 0;
+            }
+        }
+    }
+    stride = cl_addr_list[0] - cl_addr_list[1];
+    if(ghb_ctrl == 1){
+    	for (int i = pref_lookahead; i <= pref_lookahead + pref_degree; i++) {
+             pref_cl_addr = (cl_addr_list[0] + i * stride) << LOG2_BLOCK_SIZE;
+             prefetch_line(ip, addr, pref_cl_addr, FILL_L2, 0);
+    	}
+    }
+
+    curr_ptr++;
+
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L2C ghb prefetcherfinal stats" << endl;
+}

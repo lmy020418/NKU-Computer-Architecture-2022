@@ -1,0 +1,158 @@
+#include "cache.h"
+
+#define BLOCK_OFFSET_MASK (BLOCK_SIZE - 1)
+#define PREFETCH_DEGREE 4
+// delta cache
+typedef uint64_t delta_t;
+#define DELTA_NUM_SETS 128 
+#define DELTA_NUM_WAYS 16
+delta_t delta_cache_next[DELTA_NUM_SETS][DELTA_NUM_WAYS];
+uint64_t delta_cache_counter[DELTA_NUM_SETS][DELTA_NUM_WAYS];
+// page cache
+#define PAGE_NUM_SETS 256
+#define PAGE_NUM_WAYS 12
+#define PAGE_TAG_BITS 10
+uint64_t page_cache_tag[PAGE_NUM_SETS][PAGE_NUM_WAYS];
+delta_t page_cache_delta[PAGE_NUM_SETS][PAGE_NUM_WAYS];
+uint64_t page_cache_offset[PAGE_NUM_SETS][PAGE_NUM_WAYS];
+uint64_t page_cache_lru[PAGE_NUM_SETS][PAGE_NUM_WAYS];
+
+// normalization
+static delta_t norm_delta(delta_t delta) {
+    return delta + DELTA_NUM_SETS / 2;
+}
+static delta_t denorm_delta(delta_t delta) {
+    return delta - DELTA_NUM_SETS / 2;
+}
+
+// 使用LFU替换策略，向delta cache中插入新行
+static void update_delta_cache(delta_t prev_delta, delta_t curr_delta) {
+    // 命中
+    for (int i = 0; i < DELTA_NUM_WAYS; i++) {
+        if (delta_cache_next[prev_delta][i] == curr_delta) {
+            delta_cache_counter[prev_delta][i]++;
+            return;
+        }
+    }
+    // 缺失，寻找delta cache中最小的计数值
+    int way = 0;
+    uint64_t min_counter = delta_cache_counter[prev_delta][way];
+    for (int i = 1; i < DELTA_NUM_WAYS; i++) {
+        if (delta_cache_counter[prev_delta][i] < min_counter) {
+            way = i;
+            min_counter = delta_cache_counter[prev_delta][i];
+        }
+    }
+    // 替换
+    delta_cache_next[prev_delta][way] = curr_delta;
+    delta_cache_counter[prev_delta][way] = 1;
+}
+
+void CACHE::l2c_prefetcher_initialize()
+{
+    cout << "CPU " << cpu << " L2C Markov prefetcher" << endl;
+    
+    // 初始化
+    for (int i = 0; i < DELTA_NUM_SETS; i++) {
+        for (int j = 0; j < DELTA_NUM_WAYS; j++) {
+            delta_cache_next[i][j] = norm_delta(1);
+            delta_cache_counter[i][j] = 0;
+        }
+    }
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    uint64_t page_addr = addr >> LOG2_PAGE_SIZE;
+    uint64_t curr_page_offset = cl_addr & BLOCK_OFFSET_MASK;
+
+    // 查找page cache
+    uint64_t pc_set = page_addr % PAGE_NUM_SETS;
+    int pc_way = -1;
+    uint64_t pc_tag = page_addr & ((1 << PAGE_TAG_BITS) - 1);
+    for (int i = 0; i < PAGE_NUM_WAYS; i++) {
+        if (page_cache_tag[pc_set][i] == pc_tag) {
+            pc_way = i;
+            break;
+        }
+    }
+
+    delta_t curr_delta = norm_delta(1); // current delta=1 if no page cache hit
+
+    // 根据page cache的命中情况，更新delta cache的值
+    bool update_allowed = (pc_way != -1) && (cache_hit == 0);
+    if (update_allowed) {
+        delta_t prev_delta = page_cache_delta[pc_set][pc_way];
+        uint64_t prev_page_offset = page_cache_offset[pc_set][pc_way];
+        curr_delta = norm_delta(curr_page_offset - prev_page_offset);
+        update_delta_cache(prev_delta, curr_delta);
+        // 更新page cache
+        page_cache_delta[pc_set][pc_way] = curr_delta;
+    }
+    if (pc_way == -1) {
+        for (int i = 0; i < PAGE_NUM_WAYS; i++) {
+            if (page_cache_lru[pc_set][i] == 0) {
+                pc_way = i;
+                break;
+            }
+            if (pc_way == -1) {
+                pc_way = 0;
+                for (int i = 0; i < PAGE_NUM_WAYS; i++) {
+                    page_cache_lru[pc_set][i] = 0;
+                }
+            }
+        }
+    }
+
+    // 更新page cache
+    page_cache_tag[pc_set][pc_way] = pc_tag;
+    page_cache_offset[pc_set][pc_way] = curr_page_offset;
+    page_cache_lru[pc_set][pc_way] = 1;
+    
+    int degree = (MSHR.SIZE-MSHR.occupancy)*2/3;
+    if ((type==PREFETCH) && (cache_hit==0)) {
+    	degree/=2;
+    }
+    int num_pre_issued = 0;
+    // 遍历当前delta所对应的Markov链
+    uint64_t next_delta = curr_delta;
+    uint64_t next_addr = cl_addr;
+    for (int j = 0; j < degree && num_pre_issued <= degree; j++) {
+        float sum = 0;
+        for (int i = 0; i < DELTA_NUM_WAYS; i++) {
+            sum += delta_cache_counter[next_delta][i];
+        }
+        float best_prop = 0;
+        for (int i = 0; i < DELTA_NUM_WAYS; i++) {
+            float prop = delta_cache_counter[next_delta][i] / sum;
+            if (prop >= (1/3.0)) {
+                uint64_t pf_addr = (next_addr + denorm_delta(delta_cache_next[next_delta][i])) << LOG2_BLOCK_SIZE;
+                uint64_t pf_page_addr = pf_addr >> LOG2_PAGE_SIZE;
+                if (page_addr == pf_page_addr) {
+                    prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+                    num_pre_issued++;
+                }
+                if (prop > best_prop) {
+                    best_prop = prop;
+                    next_delta = delta_cache_next[next_delta][i];
+                    next_addr = pf_addr >> LOG2_BLOCK_SIZE;
+                }
+            }
+        }
+        if (best_prop == 0) {
+            break;
+        }
+    }
+
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+}

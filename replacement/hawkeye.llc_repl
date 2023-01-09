@@ -1,0 +1,254 @@
+#include "cache.h"
+#include "hawkeye_predictor.h"
+#include "optgen.h"
+#include <map>
+#include <math.h>
+
+#define NUM_CORE 1
+#define LLC_SETS NUM_CORE*2048
+#define LLC_WAYS 16
+
+// Hawkeye预测器与optgen所需变量
+HAWKEYE_PC_PREDICTOR* demand_predictor;  //Predictor
+HAWKEYE_PC_PREDICTOR* prefetch_predictor;  //Predictor
+OPTgen perset_optgen[LLC_SETS]; // occupancy vectors
+
+//RRIP计数器的定义
+#define maxRRPV 7
+uint32_t rrpv[LLC_SETS][LLC_WAYS];
+
+#define TIMER_SIZE 1024
+uint64_t perset_mytimer[LLC_SETS];
+uint64_t signatures[LLC_SETS][LLC_WAYS];
+bool prefetched[LLC_SETS][LLC_WAYS];
+
+#define bitmask(l) (((l) == 64) ? (unsigned long long)(-1LL) : ((1LL << (l))-1LL))
+#define bits(x, i, l) (((x) >> (i)) & bitmask(l))
+#define SAMPLED_SET(set) (bits(set, 0 , 6) == bits(set, ((unsigned long long)log2(LLC_SETS) - 6), 6) )
+#define SAMPLED_CACHE_SIZE 2800
+#define SAMPLER_WAYS 8
+#define SAMPLER_SETS SAMPLED_CACHE_SIZE/SAMPLER_WAYS
+
+vector<map<uint64_t, ADDR_INFO> > addr_history; // 采样器
+uint64_t num_of_evictions;
+uint64_t num_of_cache_friendly_evictions;
+
+// initialize replacement state
+void CACHE::llc_initialize_replacement()
+{
+    for (int i=0; i<LLC_SETS; i++) {
+        for (int j=0; j<LLC_WAYS; j++) {
+            rrpv[i][j] = maxRRPV;
+            signatures[i][j] = 0;
+            prefetched[i][j] = false;
+        }
+        perset_mytimer[i] = 0;
+        perset_optgen[i].init(LLC_WAYS-2);
+    }
+
+    addr_history.resize(SAMPLER_SETS);
+    for (int i=0; i<SAMPLER_SETS; i++) 
+        addr_history[i].clear();
+
+    demand_predictor = new HAWKEYE_PC_PREDICTOR();
+    prefetch_predictor = new HAWKEYE_PC_PREDICTOR();
+
+    num_of_evictions = 0;
+    num_of_cache_friendly_evictions = 0;
+
+    cout << "Initialize Hawkeye state" << endl;
+}
+
+uint32_t CACHE::llc_find_victim (uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)
+{
+    // 计算cache friendly evictions的概率
+    num_of_evictions++;
+
+    // 查找RRPV为7的行
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+        if (rrpv[set][i] == maxRRPV)
+            return i;
+
+    // 未找到cache-averse的行, 选择最老的cache-friendly行进行剔除
+    num_of_cache_friendly_evictions++;
+    uint32_t max_rrip = 0;
+    int32_t lru_victim = -1;
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+    {
+        if (rrpv[set][i] >= max_rrip){
+            max_rrip = rrpv[set][i];
+            lru_victim = i;
+        }
+    }
+
+    assert (lru_victim != -1);
+    // 使用LRU算法训练预测器
+    if(SAMPLED_SET(set)){
+        if(prefetched[set][lru_victim])
+            prefetch_predictor->decrement(signatures[set][lru_victim]);
+        else
+            demand_predictor->decrement(signatures[set][lru_victim]);
+    }
+    return lru_victim;
+
+    assert(0);
+    return 0;
+}
+
+void replace_addr_history_element(unsigned int sampler_set)
+{
+    uint64_t lru_addr = 0;
+    
+    for(map<uint64_t, ADDR_INFO>::iterator it=addr_history[sampler_set].begin(); it != addr_history[sampler_set].end(); it++) {
+        if((it->second).lru == (SAMPLER_WAYS-1)) {
+            lru_addr = it->first;
+            break;
+        }
+    }
+
+    addr_history[sampler_set].erase(lru_addr);
+}
+
+void update_addr_history_lru(unsigned int sampler_set, unsigned int curr_lru)
+{
+    for(map<uint64_t, ADDR_INFO>::iterator it=addr_history[sampler_set].begin(); it != addr_history[sampler_set].end(); it++) {
+        if((it->second).lru < curr_lru) {
+            (it->second).lru++;
+            assert((it->second).lru < SAMPLER_WAYS); 
+        }
+    }
+}
+
+void CACHE::llc_update_replacement_state (uint32_t cpu, uint32_t set, uint32_t way, uint64_t paddr, uint64_t PC, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    paddr = (paddr >> 6) << 6;
+
+    if(type == PREFETCH) {
+        if (!hit)
+            prefetched[set][way] = true;
+    }
+    else
+        prefetched[set][way] = false;
+
+    if (type == WRITEBACK) {
+        return;
+    }
+
+    if(SAMPLED_SET(set)) {
+        uint64_t curr_quanta = perset_mytimer[set] % OPTGEN_VECTOR_SIZE;
+        uint32_t sampler_set = (paddr >> 6) % SAMPLER_SETS; 
+        uint64_t sampler_tag = CRC(paddr >> 12) % 256;
+        assert(sampler_set < SAMPLER_SETS);
+
+        // 比较使用间隔与活跃间隔来决策本次的cache行是否命中
+        if((addr_history[sampler_set].find(sampler_tag) != addr_history[sampler_set].end()) && (type != PREFETCH)) {
+            unsigned int curr_timer = perset_mytimer[set];
+            if(curr_timer < addr_history[sampler_set][sampler_tag].last_quanta)
+               curr_timer = curr_timer + TIMER_SIZE;
+            bool wrap =  ((curr_timer - addr_history[sampler_set][sampler_tag].last_quanta) > OPTGEN_VECTOR_SIZE);
+            uint64_t last_quanta = addr_history[sampler_set][sampler_tag].last_quanta % OPTGEN_VECTOR_SIZE;
+
+            if( !wrap && perset_optgen[set].should_cache(curr_quanta, last_quanta)){
+                if(addr_history[sampler_set][sampler_tag].prefetched)
+                    prefetch_predictor->increment(addr_history[sampler_set][sampler_tag].PC);
+                else
+                    demand_predictor->increment(addr_history[sampler_set][sampler_tag].PC);
+            }
+            else {
+                if(addr_history[sampler_set][sampler_tag].prefetched)
+                    prefetch_predictor->decrement(addr_history[sampler_set][sampler_tag].PC);
+                else
+                    demand_predictor->decrement(addr_history[sampler_set][sampler_tag].PC);
+            }
+            perset_optgen[set].add_access(curr_quanta);
+            update_addr_history_lru(sampler_set, addr_history[sampler_set][sampler_tag].lru);
+
+            addr_history[sampler_set][sampler_tag].prefetched = false;
+        }
+        // cache行的首次访问
+        else if(addr_history[sampler_set].find(sampler_tag) == addr_history[sampler_set].end()) {
+            // 获取采样行中的被替换行
+            if(addr_history[sampler_set].size() == SAMPLER_WAYS) {
+                replace_addr_history_element(sampler_set);
+            }
+            assert(addr_history[sampler_set].size() < SAMPLER_WAYS);
+            addr_history[sampler_set][sampler_tag].init(curr_quanta);
+
+            if(type == PREFETCH) {
+                addr_history[sampler_set][sampler_tag].mark_prefetch();
+                perset_optgen[set].add_prefetch(curr_quanta);
+            }
+            else {
+                perset_optgen[set].add_access(curr_quanta);
+            }
+            update_addr_history_lru(sampler_set, SAMPLER_WAYS-1);
+        }
+        // 本次的cache行为预取操作
+        else {
+            assert(addr_history[sampler_set].find(sampler_tag) != addr_history[sampler_set].end());
+
+            uint64_t last_quanta = addr_history[sampler_set][sampler_tag].last_quanta % OPTGEN_VECTOR_SIZE;
+            if (perset_mytimer[set] - addr_history[sampler_set][sampler_tag].last_quanta < 5*NUM_CORE) {
+                if(perset_optgen[set].should_cache(curr_quanta, last_quanta)) {
+                    if(addr_history[sampler_set][sampler_tag].prefetched) {
+                        prefetch_predictor->increment(addr_history[sampler_set][sampler_tag].PC);
+                    }
+                    else {
+                       demand_predictor->increment(addr_history[sampler_set][sampler_tag].PC);
+                    }
+                }
+            }
+            addr_history[sampler_set][sampler_tag].mark_prefetch(); 
+            perset_optgen[set].add_prefetch(curr_quanta);
+            update_addr_history_lru(sampler_set, addr_history[sampler_set][sampler_tag].lru);
+        }
+
+        // 获取Hawkeye对于本次的cache行替换结果的预测值
+        bool new_prediction = demand_predictor->get_prediction (PC);
+        if (type == PREFETCH) {
+            new_prediction = prefetch_predictor->get_prediction (PC);
+        }
+        addr_history[sampler_set][sampler_tag].update(perset_mytimer[set], PC, new_prediction);
+        addr_history[sampler_set][sampler_tag].lru = 0;
+        perset_mytimer[set] = (perset_mytimer[set]+1) % TIMER_SIZE;
+    }
+
+    bool new_prediction = demand_predictor->get_prediction (PC);
+    if (type == PREFETCH) {
+        new_prediction = prefetch_predictor->get_prediction (PC);
+    }
+    signatures[set][way] = PC;
+
+    // 设置维护表中的RRIP与cache-friendly行的age值
+    if(!new_prediction) {
+        rrpv[set][way] = maxRRPV;
+    }
+    else {
+        rrpv[set][way] = 0;
+        if(!hit) {
+            bool saturated = false;
+            for(uint32_t i=0; i<LLC_WAYS; i++)
+                if (rrpv[set][i] == maxRRPV-1)
+                    saturated = true;
+
+            // 更新全部cache-friendly行的age值
+            for(uint32_t i=0; i<LLC_WAYS; i++) {
+                if (!saturated && rrpv[set][i] < maxRRPV-1)
+                    rrpv[set][i]++;
+            }
+        }
+        rrpv[set][way] = 0;
+    }
+}
+
+void CACHE::llc_replacement_final_stats() {
+    unsigned int hits = 0;
+    unsigned int demand_accesses = 0;
+    unsigned int prefetch_accesses = 0;
+    for(unsigned int i=0; i<LLC_SETS; i++) {
+        demand_accesses += perset_optgen[i].demand_access;
+        prefetch_accesses += perset_optgen[i].prefetch_access;
+        hits += perset_optgen[i].get_num_opt_hits();
+    }
+    return;
+}
